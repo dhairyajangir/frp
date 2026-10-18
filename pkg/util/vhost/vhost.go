@@ -17,9 +17,8 @@ import (
 	"fmt"
 	"net"
 	"strings"
+	"sync"
 	"time"
-
-	"github.com/fatedier/golib/errors"
 
 	"github.com/fatedier/frp/pkg/util/log"
 	netpkg "github.com/fatedier/frp/pkg/util/net"
@@ -138,6 +137,7 @@ func (v *Muxer) Listen(ctx context.Context, cfg *RouteConfig) (l *Listener, err 
 		password:        cfg.Password,
 		mux:             v,
 		accept:          make(chan net.Conn),
+		done:            make(chan struct{}),
 		ctx:             ctx,
 	}
 	err = v.registryRouter.Add(cfg.Domain, cfg.Location, cfg.RouteByHTTPUser, l)
@@ -215,10 +215,11 @@ func (v *Muxer) handle(c net.Conn) {
 	c = sConn
 
 	xl.Debugf("new request host [%s] path [%s] httpUser [%s]", name, path, httpUser)
-	err = errors.PanicToError(func() {
-		l.accept <- c
-	})
-	if err != nil {
+	select {
+	case l.accept <- c:
+		// Once delivered, the connection is owned by the caller of Accept.
+	case <-l.done:
+		_ = c.Close()
 		xl.Warnf("listener is already closed, ignore this request")
 	}
 }
@@ -232,14 +233,23 @@ type Listener struct {
 	password        string
 	mux             *Muxer // for closing Muxer
 	accept          chan net.Conn
+	done            chan struct{}
+	closeOnce       sync.Once
 	ctx             context.Context
 }
 
 func (l *Listener) Accept() (net.Conn, error) {
 	xl := xlog.FromContextSafe(l.ctx)
-	conn, ok := <-l.accept
-	if !ok {
+	select {
+	case <-l.done:
 		return nil, fmt.Errorf("listener closed")
+	default:
+	}
+	var conn net.Conn
+	select {
+	case <-l.done:
+		return nil, fmt.Errorf("listener closed")
+	case conn = <-l.accept:
 	}
 
 	// if rewriteHost func is exist
@@ -258,8 +268,10 @@ func (l *Listener) Accept() (net.Conn, error) {
 }
 
 func (l *Listener) Close() error {
-	l.mux.registryRouter.Del(l.name, l.location, l.routeByHTTPUser)
-	close(l.accept)
+	l.closeOnce.Do(func() {
+		l.mux.registryRouter.Del(l.name, l.location, l.routeByHTTPUser)
+		close(l.done)
+	})
 	return nil
 }
 
